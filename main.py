@@ -1,5 +1,9 @@
 import os
-import asyncio
+import sys
+import threading
+from fastapi import FastAPI
+import uvicorn
+
 from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardButton,
@@ -12,6 +16,25 @@ from imdb import search_movie, get_movie
 from database import users, groups, templates, bans
 
 
+# -----------------------------
+# PORT SERVER FOR RENDER
+# -----------------------------
+
+web_app = FastAPI()
+
+@web_app.get("/")
+async def root():
+    return {"status": "IMDb Bot Running"}
+
+def run_web():
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(web_app, host="0.0.0.0", port=port)
+
+
+# -----------------------------
+# TELEGRAM BOT
+# -----------------------------
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,8 +45,7 @@ app = Client(
     "imdbbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
+    bot_token=BOT_TOKEN
 )
 
 
@@ -33,52 +55,21 @@ SUPPORTED_TAGS = """
 #YEAR
 #IMDB_ID
 #IMDB_URL
-#IMDB_TITLE_TYPE
-
 #RATING
 #VOTES
-#ONLYRATING
-#NUMUSERRATINGS
-
 #DURATION
-#DURATION_IN_SECONDS
-#DURATION_IN_MINUTES
-
 #GENRE
 #LANGUAGE
-#COUNTRY_OF_ORIGIN
-#RELEASE_INFO
-
 #STORY_LINE
-#IMDB_SHORT_DESC
-#READ_MORE
-
 #ACTORS
 #DIRECTORS
-#WRITERS
-#CAST_INFO
-
 #IMG_POSTER
-#TRAILER
-#HIGH_RES_MEDIA_VIEWER
-
-#AKA
-#AWARDS
-#OTT_UPDATES
-#LETTERBOX_RATING
-
-#CERTIFICATE
-#COUNTRIES
-#KEYWORDS
-#TAGLINES
-#WATCHLIST_STATS
-#METACRITIC_SCORE
 """
 
 
-# ------------------------------------------------
+# ------------------------------
 # START
-# ------------------------------------------------
+# ------------------------------
 
 @app.on_message(filters.command("start"))
 async def start(client, message):
@@ -102,22 +93,24 @@ async def start(client, message):
     await message.reply_text("IMDb Bot Running 🚀")
 
 
-# ------------------------------------------------
+# ------------------------------
 # SUPPORTED TAGS
-# ------------------------------------------------
+# ------------------------------
 
 @app.on_message(filters.command("supported_tags"))
 async def tags(client, message):
-
     await message.reply_text(SUPPORTED_TAGS)
 
 
-# ------------------------------------------------
+# ------------------------------
 # SET TEMPLATE
-# ------------------------------------------------
+# ------------------------------
 
 @app.on_message(filters.command("set_custom_template"))
 async def set_template(client, message):
+
+    if len(message.command) < 2:
+        return await message.reply_text("Send template after command")
 
     text = message.text.split(None, 1)[1]
 
@@ -130,36 +123,41 @@ async def set_template(client, message):
     await message.reply_text("Template Saved ✅")
 
 
-# ------------------------------------------------
+# ------------------------------
 # TEMPLATE ENGINE
-# ------------------------------------------------
+# ------------------------------
 
 async def apply_template(user_id, data):
 
     user = await templates.find_one({"user": user_id})
 
     if not user:
-        return "Template not set"
+        return "Template not set. Use /set_custom_template"
 
     template = user["template"]
 
     for k, v in data.items():
-
         template = template.replace(f"#{k}", str(v))
 
     return template
 
 
-# ------------------------------------------------
+# ------------------------------
 # SEARCH COMMAND
-# ------------------------------------------------
+# ------------------------------
 
 @app.on_message(filters.command("search"))
 async def search(client, message):
 
+    if len(message.command) < 2:
+        return await message.reply_text("Example: /search inception")
+
     query = message.text.split(None, 1)[1]
 
     movies = await search_movie(query)
+
+    if not movies:
+        return await message.reply_text("No results found")
 
     buttons = []
 
@@ -178,11 +176,11 @@ async def search(client, message):
     )
 
 
-# ------------------------------------------------
+# ------------------------------
 # CALLBACK RESULT
-# ------------------------------------------------
+# ------------------------------
 
-@app.on_callback_query(filters.regex("imdb_"))
+@app.on_callback_query(filters.regex("^imdb_"))
 async def result(client, callback):
 
     imdb_id = callback.data.split("_")[1]
@@ -195,7 +193,10 @@ async def result(client, callback):
 
     if "#IMG_POSTER" in text:
 
-        await callback.message.reply_text(text)
+        await callback.message.reply_text(
+            text,
+            disable_web_page_preview=False
+        )
 
     else:
 
@@ -205,9 +206,9 @@ async def result(client, callback):
         )
 
 
-# ------------------------------------------------
+# ------------------------------
 # INLINE SEARCH
-# ------------------------------------------------
+# ------------------------------
 
 @app.on_inline_query()
 async def inline_search(client, query):
@@ -223,23 +224,43 @@ async def inline_search(client, query):
 
     for m in movies:
 
+        text = f"IMDB:{m['id']}"
+
         results.append(
             InlineQueryResultArticle(
                 title=f"{m['title']} ({m['year']})",
-                input_message_content=InputTextMessageContent(
-                    f"/search {m['title']}"
-                )
+                description="Get IMDb Info",
+                input_message_content=InputTextMessageContent(text)
             )
         )
 
     await query.answer(results, cache_time=1)
 
 
-# ------------------------------------------------
-# ADMIN COMMANDS
-# ------------------------------------------------
+# ------------------------------
+# INLINE RESULT MESSAGE
+# ------------------------------
 
-# STATS
+@app.on_message(filters.regex("^IMDB:"))
+async def inline_result(client, message):
+
+    imdb_id = message.text.split(":")[1]
+
+    data = await get_movie(imdb_id)
+
+    text = await apply_template(message.from_user.id, data)
+
+    poster = data["IMG_POSTER"]
+
+    await message.reply_photo(
+        poster,
+        caption=text
+    )
+
+
+# ------------------------------
+# ADMIN COMMANDS
+# ------------------------------
 
 @app.on_message(filters.command("stats") & filters.user(ADMINS))
 async def stats(client, message):
@@ -247,20 +268,16 @@ async def stats(client, message):
     total_users = await users.count_documents({})
     total_groups = await groups.count_documents({})
 
-    text = f"""
-Users : {total_users}
-Groups : {total_groups}
-"""
+    await message.reply_text(
+        f"Users: {total_users}\nGroups: {total_groups}"
+    )
 
-    await message.reply_text(text)
-
-
-# ------------------------------------------------
-# BROADCAST
-# ------------------------------------------------
 
 @app.on_message(filters.command("broadcast") & filters.user(ADMINS))
 async def broadcast(client, message):
+
+    if len(message.command) < 2:
+        return await message.reply_text("Send text")
 
     text = message.text.split(None, 1)[1]
 
@@ -271,19 +288,13 @@ async def broadcast(client, message):
     async for user in cursor:
 
         try:
-
             await client.send_message(user["id"], text)
             success += 1
-
         except:
             pass
 
-    await message.reply_text(f"Broadcast Done ✅\nSent : {success}")
+    await message.reply_text(f"Broadcast Done\nSent: {success}")
 
-
-# ------------------------------------------------
-# BAN USER
-# ------------------------------------------------
 
 @app.on_message(filters.command("ban") & filters.user(ADMINS))
 async def ban_user(client, message):
@@ -295,10 +306,6 @@ async def ban_user(client, message):
     await message.reply_text("User Banned 🚫")
 
 
-# ------------------------------------------------
-# UNBAN USER
-# ------------------------------------------------
-
 @app.on_message(filters.command("unban") & filters.user(ADMINS))
 async def unban_user(client, message):
 
@@ -309,10 +316,6 @@ async def unban_user(client, message):
     await message.reply_text("User Unbanned ✅")
 
 
-# ------------------------------------------------
-# RESTART
-# ------------------------------------------------
-
 @app.on_message(filters.command("restart") & filters.user(ADMINS))
 async def restart(client, message):
 
@@ -321,6 +324,10 @@ async def restart(client, message):
     os.execv(sys.executable, ['python'] + sys.argv)
 
 
-# ------------------------------------------------
+# ------------------------------
+# START SERVICES
+# ------------------------------
+
+threading.Thread(target=run_web).start()
 
 app.run()
